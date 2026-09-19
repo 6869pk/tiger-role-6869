@@ -2,6 +2,12 @@
 const SUPABASE_URL = "https://bkgyqjpbiwqzpywrzbbf.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJrZ3lxanBiaXdxenB5d3J6YmJmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk3MzcxOTUsImV4cCI6MjEwNTMxMzE5NX0.P3iZtEYI1YJ2zKHGk-NvBEq5qHt2JPuzFgo-jlUXKo8";
 
+let state = {
+  user: null,
+  profile: null,
+  sessionToken: null
+};
+
 let historyAllData = [];
 let currentHistoryPage = 1;
 const itemsPerPage = 20;
@@ -12,18 +18,24 @@ function formatCodeInGroups(code) {
   return cleaned.match(/.{1,4}/g)?.join(' ') || cleaned;
 }
 
-function getHeaders() {
-  return {
+// แก้ไขจุดสำคัญ: ส่ง Token ของผู้ใช้ไปพร้อมกับคำขอเพื่อผ่านด่าน Unauthorized
+function getHeaders(token = state.sessionToken) {
+  const headers = {
     "apikey": SUPABASE_ANON_KEY,
-    "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
     "Content-Type": "application/json"
   };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  } else {
+    headers["Authorization"] = `Bearer ${SUPABASE_ANON_KEY}`;
+  }
+  return headers;
 }
 
 async function callBackend(action, payload = {}) {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/tiger-api`, {
     method: "POST",
-    headers: getHeaders(),
+    headers: getHeaders(state.sessionToken),
     body: JSON.stringify({ action, payload })
   });
   const json = await res.json();
@@ -31,7 +43,83 @@ async function callBackend(action, payload = {}) {
   return json;
 }
 
-// เพิ่มช่องกรอกคูปองเดิม
+// ================= AUTHENTICATION & ROLE CHECK =================
+const formLogin = document.getElementById("form-login");
+const authAlert = document.getElementById("auth-alert");
+
+formLogin.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authAlert.classList.add("hidden");
+  const btn = document.getElementById("btn-login");
+  btn.textContent = "กำลังตรวจสอบ...";
+  btn.disabled = true;
+
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+
+  try {
+    // 1. เข้าสู่ระบบผ่าน Supabase Auth
+    const authRes = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: "POST",
+      headers: getHeaders(null),
+      body: JSON.stringify({ email, password })
+    });
+    const authData = await authRes.json();
+    if (!authRes.ok) throw new Error(authData.error_description || authData.message || "อีเมลหรือรหัสผ่านไม่ถูกต้อง");
+
+    state.sessionToken = authData.access_token;
+    state.user = authData.user;
+
+    // 2. ดึงสิทธิ์ (Role) จากตาราง profiles
+    const profileRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${state.user.id}&select=*`, {
+      headers: getHeaders(state.sessionToken)
+    });
+    const profiles = await profileRes.json();
+    if (!profiles || profiles.length === 0) {
+      throw new Error("ไม่พบข้อมูลสิทธิ์ผู้ใช้งาน (Profile) กรุณาตรวจสอบ UID ในฐานข้อมูล");
+    }
+
+    state.profile = profiles[0];
+    initDashboard();
+  } catch (err) {
+    authAlert.textContent = err.message;
+    authAlert.classList.remove("hidden");
+  } finally {
+    btn.textContent = "เข้าสู่ระบบ";
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("btn-logout").addEventListener("click", () => {
+  state = { user: null, profile: null, sessionToken: null };
+  document.getElementById("view-dashboard").classList.add("hidden");
+  document.getElementById("view-auth").classList.remove("hidden");
+  document.getElementById("login-password").value = "";
+});
+
+function initDashboard() {
+  document.getElementById("view-auth").classList.add("hidden");
+  document.getElementById("view-dashboard").classList.remove("hidden");
+  document.getElementById("user-display").textContent = `${state.profile.display_name} (${state.profile.email})`;
+
+  const badge = document.getElementById("badge-role");
+  const ownerPanel = document.getElementById("panel-owner");
+
+  // ตรวจสอบสิทธิ์ Owner vs Staff
+  if (state.profile.role === "owner") {
+    badge.textContent = "OWNER PORTAL";
+    badge.className = "text-xs px-2.5 py-0.5 rounded-full font-bold bg-purple-100 text-purple-800";
+    ownerPanel.classList.remove("hidden"); // แสดง 2 เมนูพิเศษสำหรับ Owner
+  } else {
+    badge.textContent = "STAFF PORTAL";
+    badge.className = "text-xs px-2.5 py-0.5 rounded-full font-semibold bg-blue-100 text-blue-800";
+    ownerPanel.classList.add("hidden"); // ซ่อนเมนู Owner
+  }
+
+  loadStaffHistory();
+}
+
+// ปุ่มเพิ่มช่องกรอกคูปองเดิม
 document.getElementById("btn-add-voucher-input").addEventListener("click", () => {
   const container = document.getElementById("voucher-inputs-container");
   const count = container.querySelectorAll(".staff-v-input").length + 1;
@@ -47,11 +135,10 @@ document.getElementById("btn-add-voucher-input").addEventListener("click", () =>
 
 // ================= ฟังก์ชันพิเศษของเจ้าของ 1: สร้าง Voucher จ่ายเอง (ลับ **1) =================
 document.getElementById("btn-owner-direct").addEventListener("click", async () => {
-  const staff = document.getElementById('staff_name').value.trim() || 'Owner';
+  const staff = state.profile?.display_name || 'Owner';
   const rawAmount = document.getElementById('owner_direct_amount').value.trim();
   const ref = document.getElementById('owner_direct_ref').value.trim() || 'OWNER-DIRECT';
 
-  // ตรวจสอบเงื่อนไขลับ **1
   if (!rawAmount.endsWith("**1")) {
     return alert("ข้อมูลไม่ถูกต้อง ไม่สามารถดำเนินการได้");
   }
@@ -75,7 +162,7 @@ document.getElementById("btn-owner-direct").addEventListener("click", async () =
     });
 
     const newCode = Array.isArray(createRes?.result) ? createRes.result[0] : (createRes?.result || createRes?.[0]);
-    if (!newCode) throw new Error("Tiger สร้างยอดเงินสำเร็จแต่ไม่ได้ส่งรหัสคูปองกลับมา");
+    if (!newCode) throw new Error("Tiger สร้างยอดเงินสำเร็จแต่ไม่ได้ส่งรหัสคูปองกลับมา");[cite: 5]
 
     await callBackend("db_insert", {
       transaction_id: txId,
@@ -112,13 +199,12 @@ document.getElementById("btn-owner-direct").addEventListener("click", async () =
 
 // ================= ฟังก์ชันพิเศษของเจ้าของ 2: ยกเลิกและออกคูปองใหม่ทดแทน (ลับ **1) =================
 document.getElementById("btn-owner-reissue").addEventListener("click", async () => {
-  const staff = document.getElementById('staff_name').value.trim() || 'Owner';
+  const staff = state.profile?.display_name || 'Owner';
   const oldCode = document.getElementById('owner_reissue_old_code').value.trim().replace(/[^0-9a-zA-Z]/g, '').toUpperCase();
   const rawAmount = document.getElementById('owner_reissue_amount').value.trim();
 
   if (!oldCode || oldCode.length < 5) return alert("กรุณาระบุรหัสคูปองเดิมให้ถูกต้อง");
 
-  // ตรวจสอบเงื่อนไขลับ **1
   if (!rawAmount.endsWith("**1")) {
     return alert("ข้อมูลไม่ถูกต้อง ไม่สามารถดำเนินการได้");
   }
@@ -136,10 +222,8 @@ document.getElementById("btn-owner-reissue").addEventListener("click", async () 
   btn.innerText = "กำลังดำเนินการ...";
 
   try {
-    // 1. สั่งยกเลิกคูปองเดิมทันที
-    await callBackend("cancel", { voucher_num: oldCode });
+    await callBackend("cancel", { voucher_num: oldCode });[cite: 5]
 
-    // 2. สร้างคูปองใบใหม่ทดแทน
     const txId = `TX-REISSUE-${Date.now()}`;
     const createRes = await callBackend("create", {
       amount: amount.toFixed(2),
@@ -148,7 +232,7 @@ document.getElementById("btn-owner-reissue").addEventListener("click", async () 
     });
 
     const newCode = Array.isArray(createRes?.result) ? createRes.result[0] : (createRes?.result || createRes?.[0]);
-    if (!newCode) throw new Error("Tiger สร้างยอดใหม่สำเร็จแต่ไม่ได้ส่งรหัสคูปองกลับมา");
+    if (!newCode) throw new Error("Tiger สร้างยอดใหม่สำเร็จแต่ไม่ได้ส่งรหัสคูปองกลับมา");[cite: 5]
 
     await callBackend("db_insert", {
       transaction_id: txId,
@@ -183,58 +267,58 @@ document.getElementById("btn-owner-reissue").addEventListener("click", async () 
   }
 });
 
-// ================= ฟังก์ชันรวมยอดคูปองสำหรับพนักงาน (จากไฟล์ตัวเก่า)[cite: 5] =================
+// ================= ฟังก์ชันรวมยอดคูปองสำหรับพนักงาน =================
 async function processStaffCombine() {
-  const staff = document.getElementById('staff_name').value.trim();
+  const staff = state.profile?.display_name || 'Staff';
   const ref = document.getElementById('staff_combine_ref').value.trim();
   const inputs = Array.from(document.querySelectorAll('.staff-v-input'))
                       .map(i => i.value.trim().replace(/[^0-9a-zA-Z]/g, ''))
-                      .filter(v => v.length > 0);
+                      .filter(v => v.length > 0);[cite: 5]
 
-  if (!staff) return alert("กรุณาระบุชื่อพนักงาน");
-  if (!ref) return alert("กรุณาระบุเลขที่บิล / เอกสารอ้างอิง");
-  if (inputs.length < 2) return alert("ต้องระบุรหัสคูปองเดิมตั้งแต่ 2 ใบขึ้นไป");
+  if (!staff) return alert("กรุณาระบุชื่อพนักงาน");[cite: 5]
+  if (!ref) return alert("กรุณาระบุเลขที่บิล / เอกสารอ้างอิง");[cite: 5]
+  if (inputs.length < 2) return alert("ต้องระบุรหัสคูปองเดิมตั้งแต่ 2 ใบขึ้นไป");[cite: 5]
 
   const btn = document.getElementById('btn-combine');
   btn.disabled = true;
-  btn.innerText = "กำลังตรวจสอบยอดจากตู้ Tiger...";
+  btn.innerText = "กำลังตรวจสอบยอดจากตู้ Tiger...";[cite: 5]
 
   try {
     let totalAmount = 0;
     let oldVoucherDetails = [];
 
     for (const code of inputs) {
-      const showRes = await callBackend("show", { voucher_num: code });
-      const voucherObj = showRes?.voucher || showRes?.result || showRes?.data || (Array.isArray(showRes) ? showRes[0] : showRes);
+      const showRes = await callBackend("show", { voucher_num: code });[cite: 5]
+      const voucherObj = showRes?.voucher || showRes?.result || showRes?.data || (Array.isArray(showRes) ? showRes[0] : showRes);[cite: 5]
 
-      const rawAmt = voucherObj?.amount ?? voucherObj?.balance;
-      const amt = parseFloat(String(rawAmt || '').replace(/,/g, ''));
-      const isUsed = String(voucherObj?.used) === "1" || voucherObj?.used === 1 || voucherObj?.used === true;
+      const rawAmt = voucherObj?.amount ?? voucherObj?.balance;[cite: 5]
+      const amt = parseFloat(String(rawAmt || '').replace(/,/g, ''));[cite: 5]
+      const isUsed = String(voucherObj?.used) === "1" || voucherObj?.used === 1 || voucherObj?.used === true;[cite: 5]
 
       if (isNaN(amt) || amt <= 0) {
-        throw new Error(`คูปอง ${code} ไม่พบยอดเงิน หรือตรวจสอบไม่ได้`);
+        throw new Error(`คูปอง ${code} ไม่พบยอดเงิน หรือตรวจสอบไม่ได้`);[cite: 5]
       }
 
       if (isUsed) {
-        throw new Error(`คูปอง ${code} ถูกใช้งานหรือยกเลิกไปแล้ว (used = 1)`);
+        throw new Error(`คูปอง ${code} ถูกใช้งานหรือยกเลิกไปแล้ว (used = 1)`);[cite: 5]
       }
 
-      await callBackend("cancel", { voucher_num: code });
-      totalAmount += amt;
-      oldVoucherDetails.push({ code: code, amount: amt });
+      await callBackend("cancel", { voucher_num: code });[cite: 5]
+      totalAmount += amt;[cite: 5]
+      oldVoucherDetails.push({ code: code, amount: amt });[cite: 5]
     }
 
-    btn.innerText = "กำลังสร้างคูปองใหม่...";
+    btn.innerText = "กำลังสร้างคูปองใหม่...";[cite: 5]
 
-    const txId = `TX-${Date.now()}`;
+    const txId = `TX-${Date.now()}`;[cite: 5]
     const createRes = await callBackend("create", {
       amount: totalAmount.toFixed(2),
       ref_num: ref,
       note: `Staff Combined: ${inputs.join(",")}`
-    });
+    });[cite: 5]
 
-    const newCode = Array.isArray(createRes?.result) ? createRes.result[0] : (createRes?.result || createRes?.[0]);
-    if (!newCode) throw new Error("Tiger สร้างยอดรวมสำเร็จแต่ไม่ได้ส่งรหัสคูปองใหม่กลับมา");
+    const newCode = Array.isArray(createRes?.result) ? createRes.result[0] : (createRes?.result || createRes?.[0]);[cite: 5]
+    if (!newCode) throw new Error("Tiger สร้างยอดรวมสำเร็จแต่ไม่ได้ส่งรหัสคูปองใหม่กลับมา");[cite: 5]
 
     await callBackend("db_insert", {
       transaction_id: txId,
@@ -245,7 +329,7 @@ async function processStaffCombine() {
       old_vouchers: oldVoucherDetails,
       ref_num: ref,
       error_message: 'รวมยอดสำเร็จ'
-    });
+    });[cite: 5]
 
     renderAndPrintCombineSlip({
       txId,
@@ -256,9 +340,9 @@ async function processStaffCombine() {
       totalAmount: totalAmount.toFixed(2),
       newCode: String(newCode),
       isReprint: false
-    });
+    });[cite: 5]
 
-    document.getElementById('staff_combine_ref').value = '';
+    document.getElementById('staff_combine_ref').value = '';[cite: 5]
     const container = document.getElementById("voucher-inputs-container");
     container.innerHTML = `
       <input type="text" placeholder="ยิงหรือพิมพ์เลขคูปองใบที่ 1" class="staff-v-input w-full px-3 py-2 border rounded-lg uppercase tracking-wider text-sm font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none">
@@ -267,32 +351,32 @@ async function processStaffCombine() {
 
     loadStaffHistory();
   } catch (err) {
-    alert("เกิดข้อผิดพลาด: " + err.message);
+    alert("เกิดข้อผิดพลาด: " + err.message);[cite: 5]
   } finally {
     btn.disabled = false;
-    btn.innerText = "ตรวจสอบยอดและดำเนินการรวมคูปอง";
+    btn.innerText = "ตรวจสอบยอดและดำเนินการรวมคูปอง";[cite: 5]
   }
 }
 
 document.getElementById('btn-combine').addEventListener('click', processStaffCombine);
 
-// ================= ฟังก์ชันยกเลิกเดี่ยว (จากไฟล์ตัวเก่า)[cite: 5] =================
+// ================= ฟังก์ชันยกเลิกเดี่ยว =================
 async function processStaffCancel() {
-  const staff = document.getElementById('staff_name').value.trim();
-  const code = document.getElementById('staff_cancel_code').value.trim().replace(/[^0-9a-zA-Z]/g, '').toUpperCase();
-  const reason = document.getElementById('staff_cancel_reason').value.trim() || 'Staff VOID';
+  const staff = state.profile?.display_name || 'Staff';
+  const code = document.getElementById('staff_cancel_code').value.trim().replace(/[^0-9a-zA-Z]/g, '').toUpperCase();[cite: 5]
+  const reason = document.getElementById('staff_cancel_reason').value.trim() || 'Staff VOID';[cite: 5]
 
-  if (!staff) return alert("กรุณาระบุชื่อพนักงาน");
-  if (!code || code.length < 5) return alert("กรุณาระบุรหัสคูปอง 12 หลัก");
-  if (!confirm(`ยืนยันการยกเลิกคูปอง ${code} หรือไม่?`)) return;
+  if (!staff) return alert("กรุณาระบุชื่อพนักงาน");[cite: 5]
+  if (!code || code.length < 5) return alert("กรุณาระบุรหัสคูปอง 12 หลัก");[cite: 5]
+  if (!confirm(`ยืนยันการยกเลิกคูปอง ${code} หรือไม่?`)) return;[cite: 5]
 
   const btn = document.getElementById('btn-cancel');
   btn.disabled = true;
-  btn.innerText = "กำลังยกเลิก...";
+  btn.innerText = "กำลังยกเลิก...";[cite: 5]
 
   try {
-    await callBackend("cancel", { voucher_num: code });
-    const txId = `VOID-${Date.now()}`;
+    await callBackend("cancel", { voucher_num: code });[cite: 5]
+    const txId = `VOID-${Date.now()}`;[cite: 5]
 
     await callBackend("db_insert", {
       transaction_id: txId,
@@ -302,7 +386,7 @@ async function processStaffCancel() {
       old_vouchers: [{ code, amount: 0 }],
       ref_num: '-',
       error_message: reason
-    });
+    });[cite: 5]
 
     renderAndPrintVoidSlip({
       txId,
@@ -310,56 +394,56 @@ async function processStaffCancel() {
       staff: staff,
       voucherNum: code,
       reason: reason
-    });
+    });[cite: 5]
 
-    document.getElementById('staff_cancel_code').value = '';
-    document.getElementById('staff_cancel_reason').value = '';
+    document.getElementById('staff_cancel_code').value = '';[cite: 5]
+    document.getElementById('staff_cancel_reason').value = '';[cite: 5]
     loadStaffHistory();
   } catch (err) {
-    alert("เกิดข้อผิดพลาด: " + err.message);
+    alert("เกิดข้อผิดพลาด: " + err.message);[cite: 5]
   } finally {
     btn.disabled = false;
-    btn.innerText = "ยืนยันการยกเลิกคูปอง";
+    btn.innerText = "ยืนยันการยกเลิกคูปอง";[cite: 5]
   }
 }
 
 document.getElementById('btn-cancel').addEventListener('click', processStaffCancel);
 
-// ================= โหลดประวัติและระบบแบ่งหน้า[cite: 5] =================
+// ================= โหลดประวัติและระบบแบ่งหน้า 20 รายการ =================
 async function loadStaffHistory() {
-  const tbody = document.getElementById('staff-history-rows');
-  const pag = document.getElementById('history-pagination');
-  pag.classList.add('hidden');
-  tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-400 font-bold">กำลังโหลดประวัติ...</td></tr>`;
+  const tbody = document.getElementById('staff-history-rows');[cite: 5]
+  const pag = document.getElementById('history-pagination');[cite: 5]
+  pag.classList.add('hidden');[cite: 5]
+  tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-400 font-bold">กำลังโหลดประวัติ...</td></tr>`;[cite: 5]
 
   try {
-    const data = await callBackend("db_select");
+    const data = await callBackend("db_select");[cite: 5]
     if (!data || data.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-400 font-bold">ยังไม่มีประวัติการทำรายการ</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-400 font-bold">ยังไม่มีประวัติการทำรายการ</td></tr>`;[cite: 5]
       return;
     }
 
-    historyAllData = data;
-    currentHistoryPage = 1;
-    renderHistoryPage();
+    historyAllData = data;[cite: 5]
+    currentHistoryPage = 1;[cite: 5]
+    renderHistoryPage();[cite: 5]
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-rose-500 font-bold">โหลดข้อมูลล้มเหลว: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-rose-500 font-bold">โหลดข้อมูลล้มเหลว: ${err.message}</td></tr>`;[cite: 5]
   }
 }
 
 document.getElementById("btn-refresh-history").addEventListener("click", loadStaffHistory);
 
 function renderHistoryPage() {
-  const tbody = document.getElementById('staff-history-rows');
-  const pag = document.getElementById('history-pagination');
-  const totalItems = historyAllData.length;
-  const totalPages = Math.ceil(totalItems / itemsPerPage) || 1;
+  const tbody = document.getElementById('staff-history-rows');[cite: 5]
+  const pag = document.getElementById('history-pagination');[cite: 5]
+  const totalItems = historyAllData.length;[cite: 5]
+  const totalPages = Math.ceil(totalItems / itemsPerPage) || 1;[cite: 5]
 
-  if (currentHistoryPage < 1) currentHistoryPage = 1;
-  if (currentHistoryPage > totalPages) currentHistoryPage = totalPages;
+  if (currentHistoryPage < 1) currentHistoryPage = 1;[cite: 5]
+  if (currentHistoryPage > totalPages) currentHistoryPage = totalPages;[cite: 5]
 
-  const startIndex = (currentHistoryPage - 1) * itemsPerPage;
-  const pageData = historyAllData.slice(startIndex, startIndex + itemsPerPage);
+  const startIndex = (currentHistoryPage - 1) * itemsPerPage;[cite: 5]
+  const pageData = historyAllData.slice(startIndex, startIndex + itemsPerPage);[cite: 5]
 
   tbody.innerHTML = pageData.map(item => `
     <tr class="hover:bg-slate-50 border-b border-slate-200 text-xs">
@@ -382,21 +466,20 @@ function renderHistoryPage() {
         <button type="button" onclick='reprintStaffRecord(${JSON.stringify(item)})' class="bg-slate-800 hover:bg-black text-white px-3.5 py-1.5 rounded-lg text-xs font-bold transition">Reprint</button>
       </td>
     </tr>
-  `).join('');
+  `).join('');[cite: 5]
 
-  pag.classList.remove('hidden');
-  document.getElementById('history-page-info').innerText = `แสดงรายการ ${startIndex + 1} - ${Math.min(startIndex + itemsPerPage, totalItems)} จากทั้งหมด ${totalItems} รายการ`;
-  document.getElementById('history-page-num').innerText = `${currentHistoryPage} / ${totalPages}`;
-  document.getElementById('btn-prev-page').disabled = currentHistoryPage === 1;
-  document.getElementById('btn-next-page').disabled = currentHistoryPage === totalPages;
+  pag.classList.remove('hidden');[cite: 5]
+  document.getElementById('history-page-info').innerText = `แสดงรายการ ${startIndex + 1} - ${Math.min(startIndex + itemsPerPage, totalItems)} จากทั้งหมด ${totalItems} รายการ`;[cite: 5]
+  document.getElementById('history-page-num').innerText = `${currentHistoryPage} / ${totalPages}`;[cite: 5]
+  document.getElementById('btn-prev-page').disabled = currentHistoryPage === 1;[cite: 5]
+  document.getElementById('btn-next-page').disabled = currentHistoryPage === totalPages;[cite: 5]
 }
 
-document.getElementById('btn-prev-page').addEventListener('click', () => { currentHistoryPage--; renderHistoryPage(); });
-document.getElementById('btn-next-page').addEventListener('click', () => { currentHistoryPage++; renderHistoryPage(); });
+document.getElementById('btn-prev-page').addEventListener('click', () => { currentHistoryPage--; renderHistoryPage(); });[cite: 5]
+document.getElementById('btn-next-page').addEventListener('click', () => { currentHistoryPage++; renderHistoryPage(); });[cite: 5]
 
-// ฟังก์ชัน Reprint ประจำจุดพนักงาน[cite: 5]
 async function reprintStaffRecord(item) {
-  const repStaff = prompt("ระบุชื่อพนักงานผู้พิมพ์ซ้ำ:", document.getElementById('staff_name').value);
+  const repStaff = prompt("ระบุชื่อพนักงานผู้พิมพ์ซ้ำ:", state.profile?.display_name || "Staff");
   if (!repStaff) return;
 
   try {
@@ -407,7 +490,7 @@ async function reprintStaffRecord(item) {
         last_reprint_at: new Date().toISOString(),
         reprinted_by: repStaff
       }
-    });
+    });[cite: 5]
   } catch (e) {
     console.warn("Update reprint count failed:", e);
   }
@@ -423,7 +506,7 @@ async function reprintStaffRecord(item) {
       newCode: item.new_voucher_code,
       isReprint: true,
       reprintBy: repStaff
-    });
+    });[cite: 5]
   } else if (item.action_type === 'CANCEL_SINGLE') {
     renderAndPrintVoidSlip({
       txId: item.transaction_id,
@@ -433,29 +516,29 @@ async function reprintStaffRecord(item) {
       reason: item.error_message,
       isReprint: true,
       reprintBy: repStaff
-    });
+    });[cite: 5]
   }
 }
 
-// ================= ฟังก์ชันพิมพ์สลิปตามของเดิม[cite: 5] =================
+// ================= ฟังก์ชันพิมพ์สลิป =================
 function renderAndPrintCombineSlip({ txId, dateStr, staff, ref, oldVouchers = [], totalAmount, newCode, isReprint = false, reprintBy }) {
-  const slip = document.getElementById("thermal-slip");
-  const headerBadge = isReprint ? `*** REPRINT SLIP (${reprintBy || staff}) ***` : `*** ใบรับเงินรวมคูปอง ***`;
-  const headerBadge2 = isReprint ? `*** REPRINT SLIP (${reprintBy || staff}) ***` : `*** หลักฐานการรวมคูปอง ***`;
+  const slip = document.getElementById("thermal-slip");[cite: 5]
+  const headerBadge = isReprint ? `*** REPRINT SLIP (${reprintBy || staff}) ***` : `*** ใบรับเงินรวมคูปอง ***`;[cite: 5]
+  const headerBadge2 = isReprint ? `*** REPRINT SLIP (${reprintBy || staff}) ***` : `*** หลักฐานการรวมคูปอง ***`;[cite: 5]
 
   const oldListHtml1 = oldVouchers.map((v, i) => `
     <div class="flex justify-between">
       <span>บิลที่ ${i + 1}: ${v.code || v.desc || ''}</span>
       <span>${parseFloat(v.amount).toFixed(2)} บาท</span>
     </div>
-  `).join('');
+  `).join('');[cite: 5]
 
   const oldListHtml2 = oldVouchers.map((v, i) => `
     <div class="flex justify-between">
       <span>${v.code || v.desc || `บิลที่ ${i + 1}`}</span>
       <span>${parseFloat(v.amount).toFixed(2)} ฿</span>
     </div>
-  `).join('');
+  `).join('');[cite: 5]
 
   slip.innerHTML = `
     <!-- ท่อนที่ 1 (ลูกค้า) -->
@@ -519,7 +602,7 @@ function renderAndPrintCombineSlip({ txId, dateStr, staff, ref, oldVouchers = []
         *** นำ QR Code ด้านบนไปสแกนที่ตู้จ่ายเงิน ***
       </div>
     </div>
-  `;
+  `;[cite: 5]
 
   new QRCode(document.getElementById("print-qr-code"), {
     text: String(newCode).trim(),
@@ -530,16 +613,16 @@ function renderAndPrintCombineSlip({ txId, dateStr, staff, ref, oldVouchers = []
     correctLevel: QRCode.CorrectLevel.M
   });
 
-  slip.classList.remove("hidden");
+  slip.classList.remove("hidden");[cite: 5]
   setTimeout(() => {
     window.print();
-    slip.classList.add("hidden");
+    slip.classList.add("hidden");[cite: 5]
   }, 200);
 }
 
 function renderAndPrintVoidSlip({ txId, dateStr, staff, voucherNum, reason, isReprint = false, reprintBy }) {
-  const slip = document.getElementById("thermal-slip");
-  const header = isReprint ? `*** REPRINT VOID SLIP (${reprintBy || staff}) ***` : `*** ใบยกเลิกคูปอง (VOID SLIP) ***`;
+  const slip = document.getElementById("thermal-slip");[cite: 5]
+  const header = isReprint ? `*** REPRINT VOID SLIP (${reprintBy || staff}) ***` : `*** ใบยกเลิกคูปอง (VOID SLIP) ***`;[cite: 5]
 
   slip.innerHTML = `
     <div class="slip-segment text-left font-mono">
@@ -561,15 +644,11 @@ function renderAndPrintVoidSlip({ txId, dateStr, staff, voucherNum, reason, isRe
         <div>( ผู้จัดการ/พยาน )</div>
       </div>
     </div>
-  `;
+  `;[cite: 5]
 
-  slip.classList.remove("hidden");
+  slip.classList.remove("hidden");[cite: 5]
   setTimeout(() => {
     window.print();
-    slip.classList.add("hidden");
+    slip.classList.add("hidden");[cite: 5]
   }, 150);
 }
-
-window.addEventListener('DOMContentLoaded', () => {
-  loadStaffHistory();
-});
